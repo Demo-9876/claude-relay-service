@@ -19,6 +19,7 @@ const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const metadataUserIdHelper = require('../../utils/metadataUserIdHelper')
+const pooParentGateway = require('../../poo-parent-gateway')
 const {
   getHttpsAgentForStream,
   getHttpsAgentForNonStream,
@@ -643,14 +644,20 @@ class ClaudeRelayService {
       bodyStoreIdNonStream = ++this._bodyStoreIdCounter
       this.bodyStore.set(bodyStoreIdNonStream, originalBodyString)
 
-      // 获取代理配置
-      const proxyAgent = await this._getProxyAgent(accountId)
+      // PoO 启用时代理由 Parent Gateway egress 执行，本进程不再创建上游 proxy agent。
+      const proxyAgent = pooParentGateway.isEnabled()
+        ? null
+        : await this._getProxyAgent(accountId, account)
+      const upstreamAbortController = new AbortController()
 
       // 设置客户端断开监听器
       const handleClientDisconnect = () => {
         logger.info('🔌 Client disconnected, aborting upstream request')
         if (upstreamRequest && !upstreamRequest.destroyed) {
           upstreamRequest.destroy()
+        }
+        if (!upstreamAbortController.signal.aborted) {
+          upstreamAbortController.abort()
         }
       }
 
@@ -688,7 +695,8 @@ class ClaudeRelayService {
             },
             {
               ...requestOptions,
-              isRealClaudeCodeRequest
+              isRealClaudeCodeRequest,
+              signal: upstreamAbortController.signal
             }
           )
 
@@ -866,7 +874,8 @@ class ClaudeRelayService {
                     error: 'opus_weekly_limit',
                     message: limitMessage
                   }),
-                  accountId
+                  accountId,
+                  proofJSON: response.proofJSON
                 }
               }
             } else {
@@ -960,7 +969,8 @@ class ClaudeRelayService {
                 error: 'upstream_rate_limited',
                 message: dedicatedRateLimitMessage
               }),
-              accountId
+              accountId,
+              proofJSON: response.proofJSON
             }
           }
         }
@@ -1694,6 +1704,38 @@ class ClaudeRelayService {
     }
   }
 
+  _buildClaudeUpstreamUrl(requestOptions = {}) {
+    const defaultUrl = new URL(this.claudeApiUrl)
+    if (requestOptions.customPath) {
+      const customUrl = new URL(requestOptions.customPath, 'https://api.anthropic.com')
+      if (!customUrl.search && defaultUrl.search) {
+        customUrl.search = defaultUrl.search
+      }
+      return customUrl
+    }
+    return defaultUrl
+  }
+
+  _getRetryBodyFromStore(bodyStoreId, context) {
+    if (!bodyStoreId || !this.bodyStore.has(bodyStoreId)) {
+      throw new Error(`${context} requires valid bodyStoreId`)
+    }
+    try {
+      return JSON.parse(this.bodyStore.get(bodyStoreId))
+    } catch (parseError) {
+      logger.error(`❌ Failed to parse body for ${context}: ${parseError.message}`)
+      throw new Error(`${context} body parse failed: ${parseError.message}`)
+    }
+  }
+
+  _createPoOStreamStatusError(statusCode) {
+    const error = new Error(`Claude API error: ${statusCode}`)
+    error.statusCode = statusCode || 502
+    error.code = 'poo_upstream_error'
+    error.submitted = true
+    return error
+  }
+
   // 🔗 发送请求到Claude API
   async _makeClaudeRequest(
     body,
@@ -1704,7 +1746,7 @@ class ClaudeRelayService {
     onRequest,
     requestOptions = {}
   ) {
-    const url = new URL(this.claudeApiUrl)
+    const url = this._buildClaudeUpstreamUrl(requestOptions)
 
     // 获取账户信息用于统一 User-Agent
     const account = await claudeAccountService.getAccount(accountId)
@@ -1729,19 +1771,43 @@ class ClaudeRelayService {
     let { bodyString } = prepared
     const { headers, isRealClaudeCode, toolNameMap } = prepared
 
-    return new Promise((resolve, reject) => {
-      // 支持自定义路径（如 count_tokens）
-      let requestPath = url.pathname
-      if (requestOptions.customPath) {
-        const baseUrl = new URL('https://api.anthropic.com')
-        const customUrl = new URL(requestOptions.customPath, baseUrl)
-        requestPath = customUrl.pathname
-      }
+    if (pooParentGateway.isEnabled()) {
+      try {
+        const pooResponse = await pooParentGateway.relayOnce({
+          method: 'POST',
+          url,
+          headers,
+          bodyBuffer: Buffer.from(bodyString, 'utf8'),
+          proxyConfig: account?.proxy,
+          tenantId: 'claude-relay-service',
+          accountId,
+          requestId: requestOptions.requestId,
+          signal: requestOptions.signal
+        })
 
+        if (!isRealClaudeCode) {
+          pooResponse.body = this._restoreToolNamesInResponseBody(pooResponse.body, toolNameMap)
+        }
+
+        logger.debug(`🔐 PoO Claude API response: ${pooResponse.statusCode}`)
+        bodyString = null
+        return pooResponse
+      } catch (error) {
+        if (pooParentGateway.isRequired() || error.submitted) {
+          throw error
+        }
+        logger.warn(
+          `⚠️ PoO Gateway unavailable before submit, falling back to direct path: ${error.message}`
+        )
+        proxyAgent = proxyAgent || (await this._getProxyAgent(accountId, account))
+      }
+    }
+
+    return new Promise((resolve, reject) => {
       const options = {
         hostname: url.hostname,
         port: url.port || 443,
-        path: requestPath + (url.search || ''),
+        path: url.pathname + url.search,
         method: 'POST',
         headers,
         agent: proxyAgent || getHttpsAgentForNonStream(),
@@ -2051,8 +2117,10 @@ class ClaudeRelayService {
       const bodyStoreId = ++this._bodyStoreIdCounter
       this.bodyStore.set(bodyStoreId, originalBodyString)
 
-      // 获取代理配置
-      const proxyAgent = await this._getProxyAgent(accountId)
+      // PoO 启用时代理由 Parent Gateway egress 执行，本进程不再创建上游 proxy agent。
+      const proxyAgent = pooParentGateway.isEnabled()
+        ? null
+        : await this._getProxyAgent(accountId, account)
 
       // 发送流式请求并捕获usage数据
       await this._makeClaudeStreamRequestWithUsageCapture(
@@ -2121,6 +2189,620 @@ class ClaudeRelayService {
     }
   }
 
+  async _makePoOClaudeStreamRequestWithUsageCapture(options) {
+    const {
+      body,
+      bodyString,
+      headers,
+      account,
+      accountId,
+      accountType,
+      sessionHash,
+      clientHeaders,
+      responseStream,
+      usageCallback,
+      requestOptions,
+      isDedicatedOfficialAccount,
+      onResponseStart,
+      requestModelFamily,
+      isOpusModelRequest,
+      toolNameStreamTransformer,
+      retryCount,
+      accessToken,
+      proxyAgent,
+      streamTransformer
+    } = options
+
+    let statusCode = null
+    let responseHeaders = {}
+    let started = false
+    let responseStartedCallbackCalled = false
+    let buffer = ''
+    const errorChunks = []
+    let proofJSONForError = null
+    const allUsageData = []
+    let currentUsageData = {}
+    let rateLimitDetected = false
+    const requestedModel = body?.model || 'unknown'
+    const { isRealClaudeCodeRequest } = requestOptions
+    let completed = false
+    const pooAbortController = new AbortController()
+    const handlePoOClientClose = () => {
+      if (!completed && !pooAbortController.signal.aborted) {
+        logger.debug('🔌 Client disconnected, aborting PoO Gateway stream request')
+        pooAbortController.abort()
+      }
+    }
+    responseStream.once('close', handlePoOClientClose)
+
+    const processSuccessChunk = (chunk) => {
+      const chunkStr = chunk.toString()
+      buffer += chunkStr
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      if (lines.length > 0) {
+        const linesToForward = `${lines.join('\n')}\n`
+        if (isStreamWritable(responseStream)) {
+          if (toolNameStreamTransformer) {
+            const transformed = toolNameStreamTransformer(linesToForward)
+            if (transformed) {
+              responseStream.write(transformed)
+            }
+          } else {
+            responseStream.write(linesToForward)
+          }
+        } else {
+          logger.warn(
+            `⚠️ [PoO Official] Client disconnected during stream, skipping ${lines.length} lines for account: ${accountId}`
+          )
+        }
+      }
+
+      for (const line of lines) {
+        if (!line.startsWith('data:')) {
+          continue
+        }
+        const jsonStr = line.slice(5).trimStart()
+        if (!jsonStr || jsonStr === '[DONE]') {
+          continue
+        }
+        try {
+          const data = JSON.parse(jsonStr)
+          if (data.type === 'message_start' && data.message?.usage) {
+            if (
+              currentUsageData.input_tokens !== undefined &&
+              currentUsageData.output_tokens !== undefined
+            ) {
+              allUsageData.push({ ...currentUsageData })
+              currentUsageData = {}
+            }
+            currentUsageData.input_tokens = data.message.usage.input_tokens || 0
+            currentUsageData.cache_creation_input_tokens =
+              data.message.usage.cache_creation_input_tokens || 0
+            currentUsageData.cache_read_input_tokens =
+              data.message.usage.cache_read_input_tokens || 0
+            currentUsageData.model = data.message.model
+            if (data.message.usage.cache_creation) {
+              currentUsageData.cache_creation = {
+                ephemeral_5m_input_tokens:
+                  data.message.usage.cache_creation.ephemeral_5m_input_tokens || 0,
+                ephemeral_1h_input_tokens:
+                  data.message.usage.cache_creation.ephemeral_1h_input_tokens || 0
+              }
+            }
+          }
+
+          if (
+            data.type === 'message_delta' &&
+            data.usage &&
+            data.usage.output_tokens !== undefined
+          ) {
+            currentUsageData.output_tokens = data.usage.output_tokens || 0
+            if (currentUsageData.input_tokens !== undefined) {
+              allUsageData.push({ ...currentUsageData })
+              currentUsageData = {}
+            }
+          }
+
+          if (
+            data.type === 'error' &&
+            data.error?.message &&
+            data.error.message.toLowerCase().includes("exceed your account's rate limit")
+          ) {
+            rateLimitDetected = true
+            logger.warn(`🚫 [PoO Stream] Rate limit detected in stream for account ${accountId}`)
+          }
+        } catch {
+          logger.debug('🔍 [PoO Stream] SSE line not JSON or no usage data:', line.slice(0, 100))
+        }
+      }
+    }
+
+    const finalizeSuccess = async (proofJSON) => {
+      if (buffer.trim() && isStreamWritable(responseStream)) {
+        if (toolNameStreamTransformer) {
+          const transformed = toolNameStreamTransformer(buffer)
+          if (transformed) {
+            responseStream.write(transformed)
+          }
+        } else {
+          responseStream.write(buffer)
+        }
+      }
+
+      if (isStreamWritable(responseStream)) {
+        completed = true
+        pooParentGateway.appendProofSSE(responseStream, proofJSON)
+        responseStream.end()
+      }
+
+      await this._finalizePoOStreamUsageAndAccountState({
+        allUsageData,
+        currentUsageData,
+        requestedModel,
+        responseHeaders,
+        statusCode,
+        rateLimitDetected,
+        accountId,
+        accountType,
+        sessionHash,
+        clientHeaders,
+        isRealClaudeCodeRequest,
+        requestModelFamily,
+        body,
+        usageCallback
+      })
+    }
+
+    try {
+      await pooParentGateway.relayStream({
+        method: 'POST',
+        url: this._buildClaudeUpstreamUrl(requestOptions),
+        headers,
+        bodyBuffer: Buffer.from(bodyString, 'utf8'),
+        proxyConfig: account?.proxy,
+        tenantId: 'claude-relay-service',
+        accountId,
+        requestId: requestOptions.requestId,
+        signal: pooAbortController.signal,
+        onHead: async (head) => {
+          ;({ statusCode } = head)
+          responseHeaders = head.headers || {}
+          logger.debug(`🔐 PoO Claude stream response status: ${statusCode}`)
+          if (statusCode === 200 && onResponseStart && !responseStartedCallbackCalled) {
+            responseStartedCallbackCalled = true
+            await onResponseStart()
+          }
+        },
+        onChunk: async (chunk) => {
+          if (statusCode === 200) {
+            started = true
+            processSuccessChunk(chunk)
+          } else {
+            errorChunks.push(Buffer.from(chunk))
+          }
+        },
+        onProof: async (proofJSON) => {
+          if (statusCode === 200) {
+            await finalizeSuccess(proofJSON)
+          } else {
+            proofJSONForError = proofJSON
+          }
+        }
+      })
+
+      if (statusCode !== 200) {
+        const errorBody = Buffer.concat(errorChunks).toString('utf8')
+        if (
+          statusCode === 403 &&
+          this._shouldRetryOn403(accountType) &&
+          retryCount < 2 &&
+          !responseStream.headersSent
+        ) {
+          logger.warn(
+            `🔄 [PoO Stream] 403 error for account ${accountId}, retry ${retryCount + 1}/2 after 2s`
+          )
+          await this._sleep(2000)
+          const retryBody = this._getRetryBodyFromStore(requestOptions.bodyStoreId, '403 retry')
+          return this._makeClaudeStreamRequestWithUsageCapture(
+            retryBody,
+            accessToken,
+            proxyAgent,
+            clientHeaders,
+            responseStream,
+            usageCallback,
+            accountId,
+            accountType,
+            sessionHash,
+            streamTransformer,
+            requestOptions,
+            isDedicatedOfficialAccount,
+            onResponseStart,
+            retryCount + 1
+          )
+        }
+
+        if (
+          this._isClaudeCodeCredentialError(errorBody) &&
+          requestOptions.useRandomizedToolNames !== true &&
+          requestOptions.bodyStoreId &&
+          this.bodyStore.has(requestOptions.bodyStoreId) &&
+          !responseStream.headersSent
+        ) {
+          const retryBody = this._getRetryBodyFromStore(
+            requestOptions.bodyStoreId,
+            'Claude Code credential retry'
+          )
+          return this._makeClaudeStreamRequestWithUsageCapture(
+            retryBody,
+            accessToken,
+            proxyAgent,
+            clientHeaders,
+            responseStream,
+            usageCallback,
+            accountId,
+            accountType,
+            sessionHash,
+            streamTransformer,
+            { ...requestOptions, useRandomizedToolNames: true },
+            isDedicatedOfficialAccount,
+            onResponseStart,
+            retryCount
+          )
+        }
+
+        completed = true
+        await this._handlePoOStreamErrorResponse({
+          statusCode,
+          headers: responseHeaders,
+          errorBody,
+          responseStream,
+          account,
+          accountId,
+          accountType,
+          sessionHash,
+          requestModelFamily,
+          body,
+          clientHeaders,
+          isOpusModelRequest,
+          isDedicatedOfficialAccount,
+          toolNameStreamTransformer,
+          proofJSON: proofJSONForError
+        })
+      }
+
+      if (requestOptions.bodyStoreId) {
+        this.bodyStore.delete(requestOptions.bodyStoreId)
+      }
+    } catch (error) {
+      if (
+        !pooParentGateway.isRequired() &&
+        !error.submitted &&
+        !started &&
+        !responseStream.headersSent &&
+        !pooAbortController.signal.aborted &&
+        requestOptions.skipPoO !== true
+      ) {
+        logger.warn(
+          `⚠️ PoO Gateway unavailable before stream submit, falling back to direct path: ${error.message}`
+        )
+        completed = true
+        const directProxyAgent = proxyAgent || (await this._getProxyAgent(accountId, account))
+        return this._makeClaudeStreamRequestWithUsageCapture(
+          body,
+          accessToken,
+          directProxyAgent,
+          clientHeaders,
+          responseStream,
+          usageCallback,
+          accountId,
+          accountType,
+          sessionHash,
+          streamTransformer,
+          { ...requestOptions, skipPoO: true },
+          isDedicatedOfficialAccount,
+          onResponseStart,
+          retryCount
+        )
+      }
+
+      logger.error(
+        `❌ PoO Claude stream request failed | Account: ${account?.name || accountId}:`,
+        error
+      )
+      if (started && isStreamWritable(responseStream)) {
+        completed = true
+        pooParentGateway.appendErrorSSE(responseStream, error)
+        responseStream.end()
+      } else if (!responseStream.headersSent) {
+        responseStream.writeHead(error.statusCode || 502, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive'
+        })
+        if (isStreamWritable(responseStream)) {
+          completed = true
+          pooParentGateway.appendErrorSSE(responseStream, error)
+          responseStream.end()
+        }
+      }
+      if (requestOptions.bodyStoreId) {
+        this.bodyStore.delete(requestOptions.bodyStoreId)
+      }
+      throw error
+    } finally {
+      completed = true
+      responseStream.removeListener('close', handlePoOClientClose)
+    }
+  }
+
+  async _finalizePoOStreamUsageAndAccountState(options) {
+    const {
+      allUsageData,
+      currentUsageData,
+      requestedModel,
+      responseHeaders,
+      statusCode,
+      rateLimitDetected,
+      accountId,
+      accountType,
+      sessionHash,
+      clientHeaders,
+      isRealClaudeCodeRequest,
+      requestModelFamily,
+      body
+    } = options
+
+    if (currentUsageData.input_tokens !== undefined) {
+      if (currentUsageData.output_tokens === undefined) {
+        currentUsageData.output_tokens = 0
+      }
+      allUsageData.push(currentUsageData)
+    }
+
+    if (allUsageData.length === 0) {
+      logger.warn('⚠️ PoO stream completed but no usage data was captured.')
+    } else {
+      const totalUsage = allUsageData.reduce(
+        (acc, usage) => ({
+          input_tokens: (acc.input_tokens || 0) + (usage.input_tokens || 0),
+          output_tokens: (acc.output_tokens || 0) + (usage.output_tokens || 0),
+          cache_creation_input_tokens:
+            (acc.cache_creation_input_tokens || 0) + (usage.cache_creation_input_tokens || 0),
+          cache_read_input_tokens:
+            (acc.cache_read_input_tokens || 0) + (usage.cache_read_input_tokens || 0),
+          models: [...(acc.models || []), usage.model].filter(Boolean)
+        }),
+        {}
+      )
+      const finalUsage = {
+        input_tokens: totalUsage.input_tokens,
+        output_tokens: totalUsage.output_tokens,
+        cache_creation_input_tokens: totalUsage.cache_creation_input_tokens,
+        cache_read_input_tokens: totalUsage.cache_read_input_tokens,
+        model: allUsageData[allUsageData.length - 1].model || requestedModel
+      }
+      let totalEphemeral5m = 0
+      let totalEphemeral1h = 0
+      allUsageData.forEach((usage) => {
+        if (usage.cache_creation && typeof usage.cache_creation === 'object') {
+          totalEphemeral5m += usage.cache_creation.ephemeral_5m_input_tokens || 0
+          totalEphemeral1h += usage.cache_creation.ephemeral_1h_input_tokens || 0
+        }
+      })
+      if (totalEphemeral5m > 0 || totalEphemeral1h > 0) {
+        finalUsage.cache_creation = {
+          ephemeral_5m_input_tokens: totalEphemeral5m,
+          ephemeral_1h_input_tokens: totalEphemeral1h
+        }
+      }
+      if (options.usageCallback && typeof options.usageCallback === 'function') {
+        options.usageCallback(finalUsage)
+      }
+    }
+
+    const sessionWindowStatus =
+      responseHeaders['anthropic-ratelimit-unified-5h-status'] ||
+      responseHeaders['Anthropic-Ratelimit-Unified-5h-Status'] ||
+      responseHeaders['ANTHROPIC-RATELIMIT-UNIFIED-5H-STATUS']
+    if (sessionWindowStatus) {
+      await claudeAccountService.updateSessionWindowStatus(accountId, sessionWindowStatus)
+    }
+
+    if (rateLimitDetected || statusCode === 429) {
+      const resetHeader = responseHeaders['anthropic-ratelimit-unified-reset']
+      const parsedResetTimestamp = resetHeader ? parseInt(resetHeader, 10) : NaN
+      if (requestModelFamily && !Number.isNaN(parsedResetTimestamp)) {
+        await claudeAccountService.markAccountModelRateLimited(
+          accountId,
+          requestModelFamily,
+          parsedResetTimestamp
+        )
+      } else if (
+        !this._isAgentViewAuxiliaryRequest(body, clientHeaders) &&
+        !Number.isNaN(parsedResetTimestamp)
+      ) {
+        await unifiedClaudeScheduler.markAccountRateLimited(
+          accountId,
+          accountType,
+          sessionHash,
+          parsedResetTimestamp
+        )
+        await upstreamErrorHelper
+          .markTempUnavailable(
+            accountId,
+            accountType,
+            429,
+            upstreamErrorHelper.parseRetryAfter(responseHeaders)
+          )
+          .catch(() => {})
+      }
+    } else if (statusCode === 200) {
+      await this.clearUnauthorizedErrors(accountId)
+      await claudeAccountService.clearInternalErrors(accountId)
+      if (await unifiedClaudeScheduler.isAccountRateLimited(accountId, accountType)) {
+        await unifiedClaudeScheduler.removeAccountRateLimit(accountId, accountType)
+      }
+      try {
+        if (await claudeAccountService.isAccountOverloaded(accountId)) {
+          await claudeAccountService.removeAccountOverload(accountId)
+        }
+      } catch (overloadError) {
+        logger.error(
+          `❌ [PoO Stream] Failed to check/remove overload status for account ${accountId}:`,
+          overloadError
+        )
+      }
+      if (clientHeaders && Object.keys(clientHeaders).length > 0 && isRealClaudeCodeRequest) {
+        await claudeCodeHeadersService.storeAccountHeaders(accountId, clientHeaders)
+      }
+    }
+  }
+
+  async _handlePoOStreamErrorResponse(options) {
+    const {
+      statusCode,
+      headers,
+      errorBody,
+      responseStream,
+      account,
+      accountId,
+      accountType,
+      sessionHash,
+      requestModelFamily,
+      body,
+      clientHeaders,
+      isOpusModelRequest,
+      isDedicatedOfficialAccount,
+      toolNameStreamTransformer,
+      proofJSON
+    } = options
+
+    if (statusCode === 401) {
+      await this.recordUnauthorizedError(accountId)
+      await upstreamErrorHelper.markTempUnavailable(accountId, accountType, 401).catch(() => {})
+      if (sessionHash) {
+        await unifiedClaudeScheduler.clearSessionMapping(sessionHash).catch(() => {})
+      }
+    } else if (statusCode === 403) {
+      if (this._isOrganizationDisabledError(statusCode, errorBody)) {
+        await unifiedClaudeScheduler
+          .markAccountBlocked(accountId, accountType, sessionHash)
+          .catch(() => {})
+      } else {
+        await upstreamErrorHelper.markTempUnavailable(accountId, accountType, 403).catch(() => {})
+      }
+      if (sessionHash) {
+        await unifiedClaudeScheduler.clearSessionMapping(sessionHash).catch(() => {})
+      }
+    } else if (statusCode === 429) {
+      const resetHeader = headers ? headers['anthropic-ratelimit-unified-reset'] : null
+      const parsedResetTimestamp = resetHeader ? parseInt(resetHeader, 10) : NaN
+      const isExtraUsageRequired = this._isExtraUsageRequired429(statusCode, errorBody)
+      const isAgentViewAuxiliaryRequest = this._isAgentViewAuxiliaryRequest(body, clientHeaders)
+
+      if (isExtraUsageRequired) {
+        logger.info(
+          `💰 [PoO Stream] "Extra usage required" 429 for account ${accountId}, skipping rate limit marking`
+        )
+      } else if (requestModelFamily) {
+        if (!Number.isNaN(parsedResetTimestamp)) {
+          await claudeAccountService.markAccountModelRateLimited(
+            accountId,
+            requestModelFamily,
+            parsedResetTimestamp
+          )
+        }
+      } else if (isAgentViewAuxiliaryRequest) {
+        logger.warn(
+          `🚫 [PoO Stream] Agent View auxiliary request hit 429 for account ${accountId}; skipping account-level rate-limit marking`
+        )
+      } else if (Number.isNaN(parsedResetTimestamp)) {
+        logger.warn(
+          `⚠️ [PoO Stream] 429 without reset header for account ${accountId}, skipping rate limit marking`
+        )
+      } else {
+        await unifiedClaudeScheduler.markAccountRateLimited(
+          accountId,
+          accountType,
+          sessionHash,
+          parsedResetTimestamp
+        )
+        await upstreamErrorHelper
+          .markTempUnavailable(
+            accountId,
+            accountType,
+            429,
+            upstreamErrorHelper.parseRetryAfter(headers)
+          )
+          .catch(() => {})
+      }
+
+      if (!isExtraUsageRequired && isOpusModelRequest && isDedicatedOfficialAccount) {
+        if (!responseStream.headersSent) {
+          responseStream.status(403)
+          responseStream.setHeader('Content-Type', 'application/json')
+        }
+        const limitPayload = {
+          error: 'opus_weekly_limit',
+          message: this._buildOpusLimitMessage(parsedResetTimestamp)
+        }
+        if (proofJSON) {
+          limitPayload.proof = proofJSON
+        }
+        responseStream.write(JSON.stringify(limitPayload))
+        responseStream.end()
+        return
+      }
+    } else if (statusCode === 529) {
+      if (config.claude.overloadHandling.enabled > 0) {
+        await claudeAccountService.markAccountOverloaded(accountId).catch(() => {})
+      }
+      await upstreamErrorHelper.markTempUnavailable(accountId, accountType, 529).catch(() => {})
+    } else if (statusCode >= 500 && statusCode < 600) {
+      await this._handleServerError(accountId, statusCode, sessionHash, '[PoO Stream]', accountType)
+    }
+
+    logger.error(
+      `❌ PoO Claude API returned error status: ${statusCode} | Account: ${account?.name || accountId}`
+    )
+    logger.error(
+      `❌ PoO Claude API error response (Account: ${account?.name || accountId}):`,
+      errorBody
+    )
+
+    if (isStreamWritable(responseStream)) {
+      let errorMessage = `Claude API error: ${statusCode}`
+      try {
+        const parsedError = JSON.parse(errorBody)
+        errorMessage = parsedError.error?.message || parsedError.message || errorMessage
+      } catch {
+        // 使用默认错误消息
+      }
+
+      if (toolNameStreamTransformer) {
+        responseStream.write(`data: ${JSON.stringify({ type: 'error', error: errorMessage })}\n\n`)
+      } else {
+        responseStream.write('event: error\n')
+        responseStream.write(
+          `data: ${JSON.stringify({
+            error: 'Claude API error',
+            status: statusCode,
+            details: errorBody,
+            timestamp: new Date().toISOString()
+          })}\n\n`
+        )
+      }
+      if (proofJSON) {
+        pooParentGateway.appendProofSSE(responseStream, proofJSON)
+      }
+      responseStream.end()
+    }
+
+    throw this._createPoOStreamStatusError(statusCode)
+  }
+
   // 🌊 发送流式请求到Claude API（带usage数据捕获）
   async _makeClaudeStreamRequestWithUsageCapture(
     body,
@@ -2171,6 +2853,31 @@ class ClaudeRelayService {
       streamTransformer,
       toolNameMap
     )
+
+    if (pooParentGateway.isEnabled() && requestOptions.skipPoO !== true) {
+      return this._makePoOClaudeStreamRequestWithUsageCapture({
+        body,
+        bodyString,
+        headers,
+        account,
+        accountId,
+        accountType,
+        sessionHash,
+        clientHeaders,
+        responseStream,
+        usageCallback,
+        requestOptions,
+        isDedicatedOfficialAccount,
+        onResponseStart,
+        retryCount,
+        requestModelFamily,
+        isOpusModelRequest,
+        toolNameStreamTransformer,
+        accessToken,
+        proxyAgent,
+        streamTransformer
+      })
+    }
 
     return new Promise((resolve, reject) => {
       const url = new URL(this.claudeApiUrl)

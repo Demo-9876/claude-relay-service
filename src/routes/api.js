@@ -1334,11 +1334,21 @@ async function handleMessagesRequest(req, res) {
           logger.warn('⚠️ No usage data found in Claude API JSON response')
         }
 
+        if (response.proofJSON) {
+          jsonData.proof = response.proofJSON
+        }
+
         // 使用 Express 内建的 res.json() 发送响应（简单可靠）
         res.json(jsonData)
       } catch (parseError) {
         logger.warn('⚠️ Failed to parse Claude API response as JSON:', parseError.message)
         logger.info('📄 Raw response body:', response.body)
+        if (response.proofJSON) {
+          return res.status(502).json({
+            error: 'invalid_response',
+            message: 'PoO response body is not valid JSON'
+          })
+        }
         // 使用 Express 内建的 res.send() 发送响应（简单可靠）
         res.send(response.body)
       }
@@ -1429,24 +1439,26 @@ async function handleMessagesRequest(req, res) {
     // 确保在任何情况下都能返回有效的JSON响应
     if (!res.headersSent) {
       // 根据错误类型设置适当的状态码
-      let statusCode = 500
-      let errorType = 'Relay service error'
+      let statusCode = handledError.statusCode || handledError.status || 500
+      let errorType = handledError.code || 'Relay service error'
 
+      const hasExplicitStatus = handledError.statusCode || handledError.status
       if (
-        handledError.message.includes('Connection reset') ||
-        handledError.message.includes('socket hang up')
+        !hasExplicitStatus &&
+        (handledError.message.includes('Connection reset') ||
+          handledError.message.includes('socket hang up'))
       ) {
         statusCode = 502
         errorType = 'Upstream connection error'
-      } else if (handledError.message.includes('Connection refused')) {
+      } else if (!hasExplicitStatus && handledError.message.includes('Connection refused')) {
         statusCode = 502
         errorType = 'Upstream service unavailable'
-      } else if (handledError.message.includes('timeout')) {
+      } else if (!hasExplicitStatus && handledError.message.includes('timeout')) {
         statusCode = 504
         errorType = 'Upstream timeout'
       } else if (
-        handledError.message.includes('resolve') ||
-        handledError.message.includes('ENOTFOUND')
+        !hasExplicitStatus &&
+        (handledError.message.includes('resolve') || handledError.message.includes('ENOTFOUND'))
       ) {
         statusCode = 502
         errorType = 'Upstream hostname resolution failed'
@@ -1831,11 +1843,23 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
       const jsonData = JSON.parse(response.body)
       if (response.statusCode < 200 || response.statusCode >= 300) {
         const sanitizedData = sanitizeUpstreamError(jsonData)
+        if (response.proofJSON) {
+          sanitizedData.proof = response.proofJSON
+        }
         res.json(sanitizedData)
       } else {
+        if (response.proofJSON) {
+          jsonData.proof = response.proofJSON
+        }
         res.json(jsonData)
       }
     } catch (parseError) {
+      if (response.proofJSON) {
+        return res.status(502).json({
+          error: 'invalid_response',
+          message: 'PoO response body is not valid JSON'
+        })
+      }
       res.send(response.body)
     }
 

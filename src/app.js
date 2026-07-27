@@ -12,6 +12,7 @@ const redis = require('./models/redis')
 const pricingService = require('./services/pricingService')
 const cacheMonitor = require('./utils/cacheMonitor')
 const { getSafeMessage } = require('./utils/errorSanitizer')
+const pooParentGateway = require('./poo-parent-gateway')
 
 // Import routes
 const apiRoutes = require('./routes/api')
@@ -48,6 +49,9 @@ class Application {
 
   async initialize() {
     try {
+      // 🔐 启动期校验 PoO Parent Gateway 配置，避免接到首个请求后才暴露配置错误
+      pooParentGateway.initialize()
+
       // 🔗 连接Redis
       logger.info('🔄 Connecting to Redis...')
       await redis.connect()
