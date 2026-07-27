@@ -1,4 +1,4 @@
-const appConfig = require('../../../config/config')
+const appConfig = require('../../config/config')
 const { getConfig, validateConfig } = require('./config')
 const gatewayClient = require('./gatewayClient')
 const responseAdapter = require('./responseAdapter')
