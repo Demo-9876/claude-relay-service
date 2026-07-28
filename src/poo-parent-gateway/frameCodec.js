@@ -102,9 +102,16 @@ async function* decodeFrameStream(readable, options = {}) {
   }
 }
 
-function buildRelayRequestFrames({ method = 'POST', url, headers = {}, bodyBuffer }) {
+function buildRelayRequestFrames({
+  method = 'POST',
+  url,
+  headers = {},
+  headersOrdered = null,
+  bodyBuffer
+}) {
   const upstreamUrl = normalizeUpstreamUrl(url)
   const token = extractBearerToken(headers)
+  const ordered = normalizeHeadersOrdered(headersOrdered)
   const reqHead = {
     nonce: randomBytes(32).toString('base64'),
     egress_port: 0,
@@ -114,6 +121,9 @@ function buildRelayRequestFrames({ method = 'POST', url, headers = {}, bodyBuffe
       path: upstreamUrl.pathname + upstreamUrl.search,
       headers: filterUpstreamHeaders(headers)
     }
+  }
+  if (ordered) {
+    reqHead.upstream.headersOrdered = ordered
   }
 
   if (token) {
@@ -167,6 +177,40 @@ function filterUpstreamHeaders(headers = {}) {
   return out
 }
 
+function normalizeHeadersOrdered(headersOrdered) {
+  if (!Array.isArray(headersOrdered)) {
+    return null
+  }
+  const out = []
+  for (const pair of headersOrdered) {
+    if (!Array.isArray(pair) || pair.length !== 2) {
+      return null
+    }
+    const [name, value] = pair
+    if (name === undefined || name === null || value === undefined || value === null) {
+      return null
+    }
+    const key = String(name)
+    const val = String(value)
+    if (!isSafeHeaderName(key) || hasUnsafeHeaderChars(val)) {
+      return null
+    }
+    out.push([key, val])
+  }
+  return out.length > 0 ? out : null
+}
+
+function isSafeHeaderName(value) {
+  return /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(String(value))
+}
+
+function hasUnsafeHeaderChars(value) {
+  return Array.from(String(value)).some((char) => {
+    const code = char.charCodeAt(0)
+    return code === 0x7f || code < 0x20
+  })
+}
+
 function findHeaderValue(headers, name) {
   const target = name.toLowerCase()
   for (const [key, value] of Object.entries(headers || {})) {
@@ -199,6 +243,7 @@ module.exports = {
   buildRelayRequestFrames,
   normalizeUpstreamUrl,
   filterUpstreamHeaders,
+  normalizeHeadersOrdered,
   extractBearerToken,
   parseJSONPayload
 }

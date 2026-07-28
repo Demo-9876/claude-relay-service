@@ -10,7 +10,8 @@ const {
 const {
   FRAME_TYPES,
   encodeFrame,
-  encodeJSONFrame
+  encodeJSONFrame,
+  decodeFramesFromBuffer
 } = require('../../src/poo-parent-gateway/frameCodec')
 
 const baseConfig = {
@@ -59,15 +60,20 @@ describe('poo-parent-gateway gatewayClient', () => {
       seen.contentType = req.headers['content-type']
       seen.proxyURL = req.headers['x-poo-proxy-url']
       seen.accountId = req.headers['x-poo-account-id']
-      req.resume()
-      res.writeHead(200, { 'Content-Type': 'application/vnd.poo.frames' })
-      res.end(
-        Buffer.concat([
-          encodeJSONFrame(FRAME_TYPES.RESP_HEAD, { status_code: 200, headers: {} }),
-          encodeFrame(FRAME_TYPES.RESP_CHUNK, Buffer.from('{"id":"msg_1"}')),
-          encodeJSONFrame(FRAME_TYPES.RESP_TRAILER, { proof })
-        ])
-      )
+      const chunks = []
+      req.on('data', (chunk) => chunks.push(chunk))
+      req.on('end', () => {
+        const frames = decodeFramesFromBuffer(Buffer.concat(chunks))
+        seen.reqHead = JSON.parse(frames[0].payload.toString('utf8'))
+        res.writeHead(200, { 'Content-Type': 'application/vnd.poo.frames' })
+        res.end(
+          Buffer.concat([
+            encodeJSONFrame(FRAME_TYPES.RESP_HEAD, { status_code: 200, headers: {} }),
+            encodeFrame(FRAME_TYPES.RESP_CHUNK, Buffer.from('{"id":"msg_1"}')),
+            encodeJSONFrame(FRAME_TYPES.RESP_TRAILER, { proof })
+          ])
+        )
+      })
     })
 
     try {
@@ -75,6 +81,11 @@ describe('poo-parent-gateway gatewayClient', () => {
         {
           url: 'https://api.anthropic.com/v1/messages',
           headers: { Authorization: 'Bearer token', 'Content-Type': 'application/json' },
+          headersOrdered: [
+            ['Host', 'api.anthropic.com'],
+            ['Authorization', ''],
+            ['Content-Length', '']
+          ],
           bodyBuffer: Buffer.from('{}'),
           proxyConfig: { type: 'http', host: 'proxy.example.com', port: 8080 },
           accountId: 'acc-1'
@@ -85,6 +96,11 @@ describe('poo-parent-gateway gatewayClient', () => {
       expect(seen.contentType).toBe('application/vnd.poo.frames')
       expect(seen.proxyURL).toBe('http://proxy.example.com:8080')
       expect(seen.accountId).toBe('acc-1')
+      expect(seen.reqHead.upstream.headersOrdered).toEqual([
+        ['Host', 'api.anthropic.com'],
+        ['Authorization', ''],
+        ['Content-Length', '']
+      ])
       expect(response.body).toBe('{"id":"msg_1"}')
       expect(response.proofJSON).toEqual(proof)
     } finally {

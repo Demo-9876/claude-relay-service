@@ -19,6 +19,26 @@ const {
 // lastUsedAt 更新节流（每账户 60 秒内最多更新一次，使用 LRU 防止内存泄漏）
 const lastUsedAtThrottle = new LRUCache(1000) // 最多缓存 1000 个账户
 const LAST_USED_AT_THROTTLE_MS = 60000
+const POO_ORDERED_HEADER_SKIP = new Set([
+  'host',
+  'content-type',
+  'accept',
+  'accept-encoding',
+  'authorization',
+  'content-length',
+  'user-agent',
+  'connection',
+  'transfer-encoding',
+  'te',
+  'trailer',
+  'upgrade',
+  'proxy-connection',
+  'keep-alive',
+  'expect',
+  'x-request-id',
+  'x-correlation-id'
+])
+const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
 
 // 抽取缓存写入 token，兼容多种字段命名
 function extractCacheCreationTokens(usageData) {
@@ -44,6 +64,17 @@ function extractCacheCreationTokens(usageData) {
   }
 
   return 0
+}
+
+function isSafePoOOrderedHeaderName(name) {
+  return HTTP_HEADER_NAME_RE.test(String(name))
+}
+
+function isSafePoOOrderedHeaderValue(value) {
+  return !Array.from(String(value)).some((char) => {
+    const code = char.charCodeAt(0)
+    return code === 0x7f || code < 0x20
+  })
 }
 
 class OpenAIResponsesRelayService {
@@ -542,6 +573,7 @@ class OpenAIResponsesRelayService {
       method: req.method,
       url: targetUrl,
       headers,
+      headersOrdered: this._buildPoOHeadersOrdered(targetUrl, headers, false),
       bodyBuffer,
       proxyConfig: fullAccount.proxy,
       tenantId: 'claude-relay-service',
@@ -591,6 +623,7 @@ class OpenAIResponsesRelayService {
           method: req.method,
           url: targetUrl,
           headers,
+          headersOrdered: this._buildPoOHeadersOrdered(targetUrl, headers, true),
           bodyBuffer,
           proxyConfig: fullAccount.proxy,
           tenantId: 'claude-relay-service',
@@ -674,6 +707,39 @@ class OpenAIResponsesRelayService {
       }
       return { value: payload, proof: proofJSON }
     }
+  }
+
+  _buildPoOHeadersOrdered(targetUrl, headers, isStream) {
+    const upstreamHost = new URL(targetUrl).hostname
+    const ordered = [
+      ['Host', upstreamHost],
+      ['Content-Type', 'application/json'],
+      ['Accept', isStream ? 'text/event-stream' : 'application/json'],
+      ['Accept-Encoding', 'identity'],
+      ['Authorization', '']
+    ]
+
+    const userAgent = headers['User-Agent'] || headers['user-agent']
+    if (userAgent) {
+      ordered.push(['User-Agent', userAgent])
+    }
+
+    for (const [rawKey, rawValue] of Object.entries(headers || {})) {
+      const lowerKey = String(rawKey).toLowerCase()
+      if (POO_ORDERED_HEADER_SKIP.has(lowerKey) || rawValue === undefined || rawValue === null) {
+        continue
+      }
+      const value = Array.isArray(rawValue)
+        ? rawValue.map((item) => String(item)).join(', ')
+        : String(rawValue)
+      if (!isSafePoOOrderedHeaderName(rawKey) || !isSafePoOOrderedHeaderValue(value)) {
+        continue
+      }
+      ordered.push([String(rawKey), value])
+    }
+
+    ordered.push(['Content-Length', ''])
+    return ordered
   }
 
   // 处理流式响应

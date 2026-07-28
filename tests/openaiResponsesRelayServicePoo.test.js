@@ -71,7 +71,8 @@ function createReq() {
     headers: {
       authorization: 'Bearer cr-test',
       'user-agent': 'curl/8.0',
-      'x-request-id': 'req-1'
+      'x-request-id': 'req-1',
+      'OpenAI-Organization': 'org-1'
     },
     body: {
       model: 'qwen3.7-plus',
@@ -172,6 +173,16 @@ describe('openaiResponsesRelayService PoO Gateway', () => {
         headers: expect.objectContaining({
           Authorization: 'Bearer sk-upstream'
         }),
+        headersOrdered: [
+          ['Host', 'dashscope.example.com'],
+          ['Content-Type', 'application/json'],
+          ['Accept', 'application/json'],
+          ['Accept-Encoding', 'identity'],
+          ['Authorization', ''],
+          ['User-Agent', 'curl/8.0'],
+          ['OpenAI-Organization', 'org-1'],
+          ['Content-Length', '']
+        ],
         proxyConfig: { type: 'http', host: '127.0.0.1', port: 7890 },
         tenantId: 'claude-relay-service',
         accountId: 'resp-1',
@@ -186,6 +197,10 @@ describe('openaiResponsesRelayService PoO Gateway', () => {
       })
     )
     expect(pooParentGateway.relayOnce.mock.calls[0][0].headers).not.toHaveProperty('authorization')
+    expect(pooParentGateway.relayOnce.mock.calls[0][0].headersOrdered).not.toContainEqual([
+      'x-request-id',
+      'req-1'
+    ])
   })
 
   test('relays stream responses through PoO streaming API and appends proof SSE', async () => {
@@ -230,6 +245,11 @@ describe('openaiResponsesRelayService PoO Gateway', () => {
       expect.objectContaining({
         method: 'POST',
         url: 'https://dashscope.example.com/compatible-mode/v1/responses',
+        headersOrdered: expect.arrayContaining([
+          ['Accept', 'text/event-stream'],
+          ['Authorization', ''],
+          ['Content-Length', '']
+        ]),
         proxyConfig: { type: 'http', host: '127.0.0.1', port: 7890 }
       })
     )

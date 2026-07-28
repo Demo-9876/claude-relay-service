@@ -48,6 +48,7 @@ async function sendGatewayRequest(options, cfg, handleFrames) {
     method: options.method || 'POST',
     url: options.url,
     headers: options.headers || {},
+    headersOrdered: options.headersOrdered,
     bodyBuffer
   })
 
