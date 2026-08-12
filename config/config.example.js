@@ -105,6 +105,24 @@ const config = {
     useIPv4: process.env.PROXY_USE_IPV4 !== 'false' // 默认 true，只有明确设置为 'false' 才使用 IPv6
   },
 
+  // 🔐 PoO Parent Gateway 配置
+  // 启用后 Claude Official 上游请求将通过 PoO Parent Gateway -> Enclave 访问上游。
+  pooParentGateway: {
+    enabled: process.env.POO_PARENT_GATEWAY_ENABLED === 'true',
+    required: process.env.POO_PARENT_GATEWAY_REQUIRED !== 'false',
+    url: process.env.POO_PARENT_GATEWAY_URL || 'http://127.0.0.1:15005/v1/proof/relay',
+    authMode: process.env.POO_PARENT_GATEWAY_AUTH_MODE || 'none',
+    timeoutMs: parseInt(process.env.POO_PARENT_GATEWAY_TIMEOUT_MS) || 600000,
+    maxBodyBytes: parseInt(process.env.POO_PARENT_GATEWAY_MAX_BODY_BYTES) || 64 * 1024 * 1024,
+    mtls: {
+      caFile: process.env.POO_PARENT_GATEWAY_CA_FILE || '',
+      certFile: process.env.POO_PARENT_GATEWAY_CERT_FILE || '',
+      keyFile: process.env.POO_PARENT_GATEWAY_KEY_FILE || '',
+      servername: process.env.POO_PARENT_GATEWAY_SERVER_NAME || ''
+    },
+    supportedProofVersions: [2]
+  },
+
   // ⏱️ 请求超时配置
   requestTimeout: parseInt(process.env.REQUEST_TIMEOUT) || 600000, // 默认 10 分钟
 

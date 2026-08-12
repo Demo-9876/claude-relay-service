@@ -7,8 +7,10 @@ const apiKeyService = require('../apiKeyService')
 const unifiedOpenAIScheduler = require('../scheduler/unifiedOpenAIScheduler')
 const config = require('../../../config/config')
 const crypto = require('crypto')
+const { PassThrough } = require('stream')
 const LRUCache = require('../../utils/lruCache')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const pooParentGateway = require('../../poo-parent-gateway')
 const {
   createRequestDetailMeta,
   extractOpenAICacheReadTokens
@@ -17,6 +19,26 @@ const {
 // lastUsedAt 更新节流（每账户 60 秒内最多更新一次，使用 LRU 防止内存泄漏）
 const lastUsedAtThrottle = new LRUCache(1000) // 最多缓存 1000 个账户
 const LAST_USED_AT_THROTTLE_MS = 60000
+const POO_ORDERED_HEADER_SKIP = new Set([
+  'host',
+  'content-type',
+  'accept',
+  'accept-encoding',
+  'authorization',
+  'content-length',
+  'user-agent',
+  'connection',
+  'transfer-encoding',
+  'te',
+  'trailer',
+  'upgrade',
+  'proxy-connection',
+  'keep-alive',
+  'expect',
+  'x-request-id',
+  'x-correlation-id'
+])
+const HTTP_HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/
 
 // 抽取缓存写入 token，兼容多种字段命名
 function extractCacheCreationTokens(usageData) {
@@ -42,6 +64,17 @@ function extractCacheCreationTokens(usageData) {
   }
 
   return 0
+}
+
+function isSafePoOOrderedHeaderName(name) {
+  return HTTP_HEADER_NAME_RE.test(String(name))
+}
+
+function isSafePoOOrderedHeaderValue(value) {
+  return !Array.from(String(value)).some((char) => {
+    const code = char.charCodeAt(0)
+    return code === 0x7f || code < 0x20
+  })
 }
 
 class OpenAIResponsesRelayService {
@@ -151,19 +184,6 @@ class OpenAIResponsesRelayService {
         signal: abortController.signal
       }
 
-      // 配置代理（如果有）
-      if (fullAccount.proxy) {
-        const proxyAgent = ProxyHelper.createProxyAgent(fullAccount.proxy)
-        if (proxyAgent) {
-          requestOptions.httpAgent = proxyAgent
-          requestOptions.httpsAgent = proxyAgent
-          requestOptions.proxy = false
-          logger.info(
-            `🌐 Using proxy for OpenAI-Responses: ${ProxyHelper.getProxyDescription(fullAccount.proxy)}`
-          )
-        }
-      }
-
       // 记录请求信息
       logger.info('📤 OpenAI-Responses relay request', {
         accountId: account.id,
@@ -175,8 +195,44 @@ class OpenAIResponsesRelayService {
         userAgent: headers['User-Agent'] || 'not set'
       })
 
-      // 发送请求
-      const response = await axios(requestOptions)
+      let response = null
+      if (pooParentGateway.isEnabled()) {
+        try {
+          response = await this._sendPoORequest({
+            req,
+            targetUrl,
+            headers,
+            fullAccount,
+            account,
+            abortController
+          })
+        } catch (error) {
+          if (pooParentGateway.isRequired() || error.submitted) {
+            throw error
+          }
+          logger.warn(
+            `⚠️ PoO Gateway unavailable before OpenAI-Responses submit, falling back to direct path: ${error.message}`
+          )
+        }
+      }
+
+      if (!response) {
+        // 配置代理（如果有）
+        if (fullAccount.proxy) {
+          const proxyAgent = ProxyHelper.createProxyAgent(fullAccount.proxy)
+          if (proxyAgent) {
+            requestOptions.httpAgent = proxyAgent
+            requestOptions.httpsAgent = proxyAgent
+            requestOptions.proxy = false
+            logger.info(
+              `🌐 Using proxy for OpenAI-Responses: ${ProxyHelper.getProxyDescription(fullAccount.proxy)}`
+            )
+          }
+        }
+
+        // 发送请求
+        response = await axios(requestOptions)
+      }
 
       // 处理 429 限流错误
       if (response.status === 429) {
@@ -209,7 +265,7 @@ class OpenAIResponsesRelayService {
             resets_in_seconds: resetsInSeconds
           }
         }
-        return res.status(429).json(errorResponse)
+        return res.status(429).json(this._attachProofToPayload(errorResponse, response.proofJSON))
       }
 
       // 处理其他错误状态码
@@ -301,7 +357,9 @@ class OpenAIResponsesRelayService {
           req.removeListener('close', handleClientDisconnect)
           res.removeListener('close', handleClientDisconnect)
 
-          return res.status(401).json(unauthorizedResponse)
+          return res
+            .status(401)
+            .json(this._attachProofToPayload(unauthorizedResponse, response.proofJSON))
         }
 
         // 处理 5xx 上游错误
@@ -333,7 +391,12 @@ class OpenAIResponsesRelayService {
 
         return res
           .status(response.status)
-          .json(upstreamErrorHelper.sanitizeErrorForClient(errorData))
+          .json(
+            this._attachProofToPayload(
+              upstreamErrorHelper.sanitizeErrorForClient(errorData),
+              response.proofJSON
+            )
+          )
       }
 
       // 更新最后使用时间（节流）
@@ -455,10 +518,30 @@ class OpenAIResponsesRelayService {
             }
           }
 
-          return res.status(401).json(unauthorizedResponse)
+          return res
+            .status(401)
+            .json(this._attachProofToPayload(unauthorizedResponse, error.response.proofJSON))
         }
 
-        return res.status(status).json(upstreamErrorHelper.sanitizeErrorForClient(errorData))
+        return res
+          .status(status)
+          .json(
+            this._attachProofToPayload(
+              upstreamErrorHelper.sanitizeErrorForClient(errorData),
+              error.response.proofJSON
+            )
+          )
+      }
+
+      if (error.code && String(error.code).startsWith('poo_')) {
+        const statusCode = error.statusCode || 502
+        return res.status(statusCode).json({
+          error: {
+            message: error.message || 'PoO Gateway request failed',
+            type: 'poo_error',
+            code: error.code
+          }
+        })
       }
 
       // 其他错误
@@ -470,6 +553,193 @@ class OpenAIResponsesRelayService {
         }
       })
     }
+  }
+
+  async _sendPoORequest({ req, targetUrl, headers, fullAccount, account, abortController }) {
+    const bodyBuffer = Buffer.from(JSON.stringify(req.body || {}), 'utf8')
+    if (req.body?.stream) {
+      return this._sendPoOStreamRequest({
+        req,
+        targetUrl,
+        headers,
+        bodyBuffer,
+        fullAccount,
+        account,
+        abortController
+      })
+    }
+
+    const pooResponse = await pooParentGateway.relayOnce({
+      method: req.method,
+      url: targetUrl,
+      headers,
+      headersOrdered: this._buildPoOHeadersOrdered(targetUrl, headers, false),
+      bodyBuffer,
+      proxyConfig: fullAccount.proxy,
+      tenantId: 'claude-relay-service',
+      accountId: account.id,
+      requestId: req.headers['x-request-id'] || req.headers['x-correlation-id'],
+      timeoutMs: this.defaultTimeout,
+      signal: abortController?.signal
+    })
+
+    logger.debug(`🔐 PoO OpenAI-Responses API response: ${pooResponse.statusCode}`)
+
+    const body = pooResponse.body || ''
+
+    return {
+      status: pooResponse.statusCode,
+      statusText: '',
+      headers: pooResponse.headers || {},
+      data: this._parseJSONBody(body),
+      proofJSON: pooResponse.proofJSON
+    }
+  }
+
+  async _sendPoOStreamRequest({
+    req,
+    targetUrl,
+    headers,
+    bodyBuffer,
+    fullAccount,
+    account,
+    abortController
+  }) {
+    const data = new PassThrough()
+    let response = null
+    let responseResolved = false
+    const errorChunks = []
+
+    const responseReady = new Promise((resolve, reject) => {
+      const resolveResponse = () => {
+        if (!responseResolved) {
+          responseResolved = true
+          resolve(response)
+        }
+      }
+
+      pooParentGateway
+        .relayStream({
+          method: req.method,
+          url: targetUrl,
+          headers,
+          headersOrdered: this._buildPoOHeadersOrdered(targetUrl, headers, true),
+          bodyBuffer,
+          proxyConfig: fullAccount.proxy,
+          tenantId: 'claude-relay-service',
+          accountId: account.id,
+          requestId: req.headers['x-request-id'] || req.headers['x-correlation-id'],
+          timeoutMs: this.defaultTimeout,
+          signal: abortController?.signal,
+          onHead: async (head) => {
+            response = {
+              status: head.statusCode,
+              statusText: '',
+              headers: head.headers || {},
+              data,
+              proofJSON: null
+            }
+            logger.debug(`🔐 PoO OpenAI-Responses stream response: ${head.statusCode}`)
+            if (head.statusCode < 400) {
+              resolveResponse()
+            }
+          },
+          onChunk: async (chunk) => {
+            if (response?.status >= 400) {
+              errorChunks.push(Buffer.from(chunk))
+              return
+            }
+            data.write(chunk)
+          },
+          onProof: async (proofJSON) => {
+            if (response) {
+              response.proofJSON = proofJSON
+            }
+          }
+        })
+        .then((result) => {
+          if (response) {
+            response.proofJSON = result.proofJSON
+          }
+          if (response?.status >= 400) {
+            response.data = this._parseJSONBody(Buffer.concat(errorChunks).toString('utf8'))
+            resolveResponse()
+            return
+          }
+          data.end()
+        })
+        .catch((error) => {
+          if (!response || !responseResolved) {
+            reject(error)
+            return
+          }
+          data.destroy(error)
+        })
+    })
+
+    return responseReady
+  }
+
+  _parseJSONBody(body) {
+    if (body && typeof body === 'object') {
+      return body
+    }
+    if (typeof body !== 'string') {
+      return body
+    }
+    try {
+      return JSON.parse(body)
+    } catch (error) {
+      return body
+    }
+  }
+
+  _attachProofToPayload(payload, proofJSON) {
+    if (!proofJSON) {
+      return payload
+    }
+    try {
+      return pooParentGateway.injectProofIntoJSON(payload, proofJSON)
+    } catch (error) {
+      logger.warn('⚠️ Failed to inject PoO proof into OpenAI-Responses payload:', error.message)
+      if (payload && typeof payload.pipe === 'function') {
+        return payload
+      }
+      return { value: payload, proof: proofJSON }
+    }
+  }
+
+  _buildPoOHeadersOrdered(targetUrl, headers, isStream) {
+    const upstreamHost = new URL(targetUrl).hostname
+    const ordered = [
+      ['Host', upstreamHost],
+      ['Content-Type', 'application/json'],
+      ['Accept', isStream ? 'text/event-stream' : 'application/json'],
+      ['Accept-Encoding', 'identity'],
+      ['Authorization', '']
+    ]
+
+    const userAgent = headers['User-Agent'] || headers['user-agent']
+    if (userAgent) {
+      ordered.push(['User-Agent', userAgent])
+    }
+
+    for (const [rawKey, rawValue] of Object.entries(headers || {})) {
+      const lowerKey = String(rawKey).toLowerCase()
+      if (POO_ORDERED_HEADER_SKIP.has(lowerKey) || rawValue === undefined || rawValue === null) {
+        continue
+      }
+      const value = Array.isArray(rawValue)
+        ? rawValue.map((item) => String(item)).join(', ')
+        : String(rawValue)
+      if (!isSafePoOOrderedHeaderName(rawKey) || !isSafePoOOrderedHeaderValue(value)) {
+        continue
+      }
+      ordered.push([String(rawKey), value])
+    }
+
+    ordered.push(['Content-Length', ''])
+    return ordered
   }
 
   // 处理流式响应
@@ -677,6 +947,9 @@ class OpenAIResponsesRelayService {
       res.removeListener('close', handleClientDisconnect)
 
       if (!res.destroyed) {
+        if (response.proofJSON) {
+          pooParentGateway.appendProofSSE(res, response.proofJSON)
+        }
         res.end()
       }
 
@@ -695,7 +968,13 @@ class OpenAIResponsesRelayService {
       req.removeListener('close', handleClientDisconnect)
       res.removeListener('close', handleClientDisconnect)
 
-      if (!res.headersSent) {
+      if (error.code && String(error.code).startsWith('poo_') && !res.destroyed) {
+        if (!res.headersSent) {
+          res.status(error.statusCode || 502)
+        }
+        pooParentGateway.appendErrorSSE(res, error)
+        res.end()
+      } else if (!res.headersSent) {
         res.status(502).json({ error: { message: 'Upstream stream error' } })
       } else if (!res.destroyed) {
         res.end()
@@ -790,7 +1069,7 @@ class OpenAIResponsesRelayService {
     }
 
     // 返回响应
-    res.status(response.status).json(responseData)
+    res.status(response.status).json(this._attachProofToPayload(responseData, response.proofJSON))
 
     logger.info('Normal response completed', {
       accountId: account.id,

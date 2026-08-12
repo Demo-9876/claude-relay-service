@@ -425,17 +425,24 @@ async function handleChatCompletion(req, res, apiKeyData) {
 
       // 处理错误响应
       if (claudeResponse.statusCode >= 400) {
-        return res.status(claudeResponse.statusCode).json({
+        const errorEnvelope = {
           error: {
             message: claudeData.error?.message || 'Claude API error',
             type: claudeData.error?.type || 'api_error',
             code: claudeData.error?.code || 'unknown_error'
           }
-        })
+        }
+        if (claudeResponse.proofJSON) {
+          errorEnvelope.proof = claudeResponse.proofJSON
+        }
+        return res.status(claudeResponse.statusCode).json(errorEnvelope)
       }
 
       // 转换为 OpenAI 格式
       const openaiResponse = openaiToClaude.convertResponse(claudeData, req.body.model)
+      if (claudeResponse.proofJSON) {
+        openaiResponse.proof = claudeResponse.proofJSON
+      }
 
       // 记录使用统计
       if (claudeData.usage) {
@@ -525,12 +532,12 @@ async function handleChatCompletion(req, res, apiKeyData) {
       if (error.message === 'Client disconnected') {
         res.status(499).end()
       } else {
-        const status = error.status || 500
+        const status = error.statusCode || error.status || 500
         res.status(status).json({
           error: {
             message: getSafeMessage(error),
             type: 'server_error',
-            code: 'internal_error'
+            code: error.code || 'internal_error'
           }
         })
       }
